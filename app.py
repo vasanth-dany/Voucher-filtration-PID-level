@@ -84,9 +84,13 @@ with st.sidebar:
     st.caption(f"RRP idx={price_cols['price']}  SRP idx={price_cols['special_price']}  Disc idx={price_cols['disc_pct']}")
 
     st.divider()
-    st.subheader("Shopee File Settings")
-    pid_col_name   = st.text_input("Product ID column name", value="ParentSKU",
-        help="Check your Shopee SellerPriceTemplate row 1 header for the Product ID column name")
+    st.subheader("Shopee File Column Names")
+    st.caption("Match these to your Shopee SellerPriceTemplate row 1 headers exactly")
+    sku_col_name   = st.text_input("SKU / EAN column name", value="SKU",
+        help="Column containing the EAN/barcode used to look up ALU_NO")
+    price_col_name = st.text_input("Price column name", value="Price")
+    pid_col_name   = st.text_input("Product ID column name", value="Product ID",
+        help="Column that groups variants under one product listing")
     data_start_row = st.number_input("Data starts at row", value=2, min_value=2)
 
 ZECOM_COLS = {
@@ -287,11 +291,11 @@ product listing, so a product with even one ineligible variant cannot participat
                         if h and str(h).strip().lower() == name.lower(): return idx
                     return None
 
-                sku_col   = fc("SellerSKU")
-                price_col = fc("Price")
+                sku_col   = fc(sku_col_name)
+                price_col = fc(price_col_name)
                 pid_col   = fc(pid_col_name)
-                if not sku_col:  raise ValueError("No 'SellerSKU' column in row 1")
-                if not price_col: raise ValueError("No 'Price' column in row 1")
+                if not sku_col:  raise ValueError(f"Column '{sku_col_name}' not found in row 1 — check the 'SKU / EAN column name' in the sidebar")
+                if not price_col: raise ValueError(f"Column '{price_col_name}' not found in row 1 — check the 'Price column name' in the sidebar")
                 if not pid_col:
                     raise ValueError(
                         f"Column '{pid_col_name}' not found in row 1. "
@@ -299,6 +303,7 @@ product listing, so a product with even one ineligible variant cannot participat
                     )
                 last_col = max((i for i,h in enumerate(headers,1) if h), default=len(headers))
                 log(f"✓ Sheet='{ws.title}' | PID col='{pid_col_name}' (col {pid_col})")
+                log(f"  Row 1 headers: {[h for h in headers if h]}")
 
                 # ── PASS 1: per-SKU eligibility ──────────────────
                 pass1 = []  # (r, pid, alu_no, row_vals, excl_v, elig)
@@ -323,7 +328,9 @@ product listing, so a product with even one ineligible variant cannot participat
                             matched_zecom += 1
                             live, status = rec["Launch_Date"], rec["Status"]
                             rrp, srp, pct, excl = rec["Price"], rec["Special_Price"], rec["Disc_Pct"], rec["Exclusion"]
-                            try: rrp_check = round(float(rrp),2) == round(float(orig_price),2)
+                            try:
+                                orig_p = float(str(orig_price).replace("'","").strip()) if orig_price is not None else None
+                                rrp_check = round(float(rrp),2) == round(orig_p,2) if orig_p is not None else NA
                             except: rrp_check = NA
                             row_vals = [alu_no, live, status, rrp, srp, rrp_check, pct, excl]
 
