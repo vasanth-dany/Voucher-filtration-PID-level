@@ -18,8 +18,10 @@ OUTPUT_FILE  = 'outputs/Shopee_Voucher_Filtration.xlsx'
 # ------------------------------------------------------------
 # 2. SHOPEE FILE SETTINGS
 # ------------------------------------------------------------
-PRODUCT_ID_COL_NAME = 'ParentSKU'   # column header for Product ID in the Shopee template
-DATA_START_ROW      = 2              # Shopee templates usually have headers at row 1, data at row 2
+PRODUCT_ID_COL_NAME = 'Product ID'   # col 1 — groups all variants of a product
+SKU_COL_NAME        = 'SKU'          # col 6 — contains the EAN barcode
+PRICE_COL_NAME      = 'Price'        # col 7
+DATA_START_ROW      = 2              # headers at row 1, data from row 2
 
 # ------------------------------------------------------------
 # 3. CAMPAIGN TYPE — determines which zeCOM price columns to use
