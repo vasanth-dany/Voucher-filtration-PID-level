@@ -3,14 +3,15 @@ Voucher Filtration Automation — Shopee
 =======================================
 Run: streamlit run app.py
 
-PID-level rule: if ANY SKU under a Product ID is ineligible
-(Status ≠ YES, future launch date, AM excluded, or price below threshold),
-ALL SKUs under that Product ID are blanked — even if other SKUs would
-individually qualify.
+PID-level rule: if ANY SKU under a Product ID has a REAL eligibility failure
+(Status=NO, future launch date, AM excluded, or price below threshold),
+ALL SKUs under that Product ID are blanked.
 
-Output: the original Shopee SellerPriceTemplate with ALU_NO / Live / Status /
-RRP / SRP / RRP check / % / Exclusions + one YES/blank column per mechanic
-appended directly onto the same sheet.
+Key Shopee logic vs Lazada:
+  - SKUs with Status=#N/A (not in zeCOM tracking) are treated as
+    "untracked / no restriction" — they can still get YES for mechanics
+    that include '#N/A' in their match values (e.g. 50% NMS open default).
+  - Untracked SKUs do NOT cause PID blocking.
 """
 
 import streamlit as st
@@ -52,46 +53,55 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     st.subheader("Eligibility Rules")
-    st.caption(
-        "**PID-level rule:** if ANY SKU in a Product ID group fails eligibility, "
-        "ALL SKUs in that group are blanked."
-    )
-    apply_threshold = st.checkbox("Require RRP & SRP ≥ minimum price", value=False)
-    min_price = st.number_input("Minimum price", value=39, min_value=0, step=1, disabled=not apply_threshold)
+    with st.expander("How PID-level blocking works", expanded=False):
+        st.markdown("""
+**Pass 1 — per-SKU classification:**
+- `Status = NO` → **blocks PID**
+- `Status = YES` + future launch date → **blocks PID**
+- `Status = YES` + price below threshold → **blocks PID**
+- `Status = YES` + AM excluded → **blocks PID**
+- `Status = YES` + passes all → eligible, matched by Exclusion text
+- `Status = #N/A` (not in zeCOM) → **does NOT block PID**, eligible for mechanics that include `#N/A` in match values
+
+**Pass 2 — PID gate:**
+If ANY SKU in a Product ID triggered a block in Pass 1,
+ALL SKUs in that Product ID get blank mechanic columns.
+        """)
+
+    apply_threshold = st.checkbox("Require RRP & SRP ≥ minimum price", value=True)
+    min_price = st.number_input("Minimum price", value=39, min_value=0, step=1,
+        disabled=not apply_threshold)
 
     st.divider()
     st.subheader("Campaign Type")
-    st.caption("Selects the correct price columns from zeCOM automatically")
-
+    st.caption("Auto-selects the correct zeCOM price columns")
     CAMPAIGN_PRICE_COLS = {
         "BAU":               {"price": 54, "special_price": 55, "disc_pct": 56},
         "Mid Month / Payday":{"price": 57, "special_price": 58, "disc_pct": 59},
         "Double Digit":      {"price": 60, "special_price": 61, "disc_pct": 62},
         "Mega":              {"price": 63, "special_price": 64, "disc_pct": 65},
     }
-    campaign_type = st.selectbox("Shopee campaign type", list(CAMPAIGN_PRICE_COLS.keys()), index=1)
+    campaign_type = st.selectbox("Shopee campaign type",
+        list(CAMPAIGN_PRICE_COLS.keys()), index=1)
     price_cols = CAMPAIGN_PRICE_COLS[campaign_type]
 
     st.divider()
     st.subheader("zeCOM Column Positions")
-    st.caption("0-based index — update if the tracking file layout changes")
-    col_style  = st.number_input("Style# (ALU_NO)",    value=2,  min_value=0)
-    col_launch = st.number_input("Launch Date",         value=21, min_value=0)
-    col_status = st.number_input("Status Shopee",       value=24, min_value=0)
-    col_excl   = st.number_input("Exclusion",           value=66, min_value=0)
-
-    st.caption(f"Price columns auto-set for **{campaign_type}**:")
-    st.caption(f"RRP idx={price_cols['price']}  SRP idx={price_cols['special_price']}  Disc idx={price_cols['disc_pct']}")
+    st.caption("0-based index")
+    col_style  = st.number_input("Style# (ALU_NO)",  value=2,  min_value=0)
+    col_launch = st.number_input("Launch Date",       value=21, min_value=0)
+    col_status = st.number_input("Status Shopee",     value=24, min_value=0)
+    col_excl   = st.number_input("Exclusion",         value=66, min_value=0)
+    st.caption(f"Price cols auto-set ({campaign_type}): "
+               f"RRP={price_cols['price']} SRP={price_cols['special_price']} Disc={price_cols['disc_pct']}")
 
     st.divider()
     st.subheader("Shopee File Column Names")
-    st.caption("Match these to your Shopee SellerPriceTemplate row 1 headers exactly")
-    sku_col_name   = st.text_input("SKU / EAN column name", value="SKU",
-        help="Column containing the EAN/barcode used to look up ALU_NO")
-    price_col_name = st.text_input("Price column name", value="Price")
-    pid_col_name   = st.text_input("Product ID column name", value="Product ID",
-        help="Column that groups variants under one product listing")
-    data_start_row = st.number_input("Data starts at row", value=2, min_value=2)
+    st.caption("Must match your SellerPriceTemplate row 1 headers exactly")
+    sku_col_name   = st.text_input("SKU / EAN column",      value="SKU")
+    price_col_name = st.text_input("Price column",           value="Price")
+    pid_col_name   = st.text_input("Product ID column",      value="Product ID")
+    data_start_row = st.number_input("Data starts at row",   value=2, min_value=2)
 
 ZECOM_COLS = {
     "style": int(col_style), "launch_date": int(col_launch),
@@ -107,6 +117,7 @@ def normalise_ean(v):
 
 
 def matches_mechanic(excl_val, mech):
+    """Returns True if excl_val matches this mechanic's rules."""
     el = str(excl_val).strip().lower()
     mv = [v.lower() for v in mech["match_values"]]
     ex = [v.lower() for v in mech.get("excludes", [])]
@@ -120,29 +131,46 @@ def build_mechanics(raw):
         name = m["name"].strip()
         mvs = [v.strip() for v in m["match_values"].splitlines() if v.strip()]
         if name and mvs:
-            out.append({"name": name, "match_type": m["match_type"], "match_values": mvs,
-                        "excludes": [v.strip() for v in m["excludes"].split(",") if v.strip()]})
+            out.append({
+                "name": name,
+                "match_type": m["match_type"],
+                "match_values": mvs,
+                "excludes": [v.strip() for v in m["excludes"].split(",") if v.strip()],
+            })
     return out
 
 
-def is_eligible_sku(status, live, alu_no, rrp, srp, am_set):
-    if status != "YES":
-        return False
+def classify_sku(status, live, alu_no, rrp, srp, am_set):
+    """
+    Returns one of:
+      'eligible'    — Status=YES, passes all checks
+      'status_no'   — Status=NO  → blocks PID
+      'future'      — future launch date → blocks PID
+      'am_excluded' — in AM exclusion list → blocks PID
+      'low_price'   — RRP or SRP below threshold → blocks PID
+      'untracked'   — Status=#N/A (not in zeCOM) → does NOT block PID,
+                      eligible only for mechanics with '#N/A' in match values
+    """
+    if status == "NO":
+        return "status_no"
+    if status == NA or status is None:
+        return "untracked"
+    # Status = YES from here
     if isinstance(live, (date, datetime)):
         ld = live.date() if isinstance(live, datetime) else live
         if ld > TODAY:
-            return False
+            return "future"
     if alu_no and alu_no in am_set:
-        return False
+        return "am_excluded"
     if apply_threshold:
         for pv in (rrp, srp):
             if pv not in (NA, None):
                 try:
                     if float(pv) < min_price:
-                        return False
+                        return "low_price"
                 except (TypeError, ValueError):
                     pass
-    return True
+    return "eligible"
 
 
 def mechanic_ui(state_key):
@@ -154,19 +182,24 @@ def mechanic_ui(state_key):
     for i, mech in enumerate(st.session_state[state_key]):
         with st.container(border=True):
             c1, c2, c3 = st.columns([4, 2, 1])
-            mech["name"] = c1.text_input("Column header name", value=mech["name"],
-                key=f"{state_key}_name_{i}", placeholder="e.g. 20% NMS (All 20% VC Remark)")
-            mech["match_type"] = c2.selectbox("Match type", ["contains", "exact"],
-                index=["contains","exact"].index(mech["match_type"]),
+            mech["name"] = c1.text_input(
+                "Column header name", value=mech["name"],
+                key=f"{state_key}_name_{i}",
+                placeholder="e.g. 50% NMS (50% VC ONLY - Shopee exclusive clearance)")
+            mech["match_type"] = c2.selectbox(
+                "Match type", ["contains", "exact"],
+                index=["contains", "exact"].index(mech["match_type"]),
                 key=f"{state_key}_type_{i}")
             c3.markdown("&nbsp;")
             if c3.button("🗑️", key=f"{state_key}_rm_{i}"):
                 _remove = i
-            mech["match_values"] = st.text_area("zeCOM Exclusion value(s) — one per line",
-                value=mech["match_values"], key=f"{state_key}_mv_{i}", height=68,
-                placeholder="Open for all")
+            mech["match_values"] = st.text_area(
+                "zeCOM Exclusion value(s) — one per line  "
+                "*(add `#N/A` to include untracked/not-in-zeCOM products)*",
+                value=mech["match_values"], key=f"{state_key}_mv_{i}", height=80,
+                placeholder="50% VC ONLY - Shopee exclusive clearance\n#N/A")
             mech["excludes"] = st.text_input(
-                "Exclude if text also contains (comma-separated, optional)",
+                "Exclude if Exclusion text also contains (comma-separated, optional)",
                 value=mech["excludes"], key=f"{state_key}_ex_{i}",
                 placeholder="e.g. No platform VC")
     if _remove is not None:
@@ -181,7 +214,12 @@ def mechanic_ui(state_key):
 # ── TAB 1: RUN FILTRATION ──────────────────────────────────────
 with tab_run:
     st.subheader("🎯 Voucher Mechanics")
-    st.caption("Define one entry per campaign mechanic — names and match values change every campaign.")
+    st.info(
+        "**Tip for open/default mechanics (e.g. 50% NMS):** add `#N/A` as one of the "
+        "match values to include products not in the zeCOM tracking file. "
+        "These products have no specific exclusion restriction and default to the open campaign.",
+        icon="💡"
+    )
     mechanic_ui("sh_mechanics")
 
     st.divider()
@@ -189,51 +227,39 @@ with tab_run:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("**1. Price / Stock File** *(required)*")
-        price_file = st.file_uploader("Shopee SellerPriceTemplate", type=["xlsx","xls"], key="price")
+        price_file = st.file_uploader("Shopee SellerPriceTemplate",
+            type=["xlsx", "xls"], key="price")
     with c2:
         st.markdown("**2. Content File** *(required)*")
-        content_file = st.file_uploader("Content_file", type=["xlsx","xls"], key="content")
+        content_file = st.file_uploader("Content_file",
+            type=["xlsx", "xls"], key="content")
     with c3:
         st.markdown("**3. zeCOM Tracking File** *(required)*")
-        zecom_file = st.file_uploader("zeCOM_Tracking_File", type=["xlsx","xls"], key="zecom")
+        zecom_file = st.file_uploader("zeCOM_Tracking_File",
+            type=["xlsx", "xls"], key="zecom")
     c4, c5 = st.columns(2)
     with c4:
         st.markdown("**4. AM Exclusion File** *(optional)*")
-        am_file = st.file_uploader("AM_Exclusion.xlsx", type=["xlsx","xls"], key="am")
+        am_file = st.file_uploader("AM_Exclusion.xlsx",
+            type=["xlsx", "xls"], key="am")
     with c5:
         st.markdown("**Output filename** *(optional)*")
         out_name = st.text_input("out", value="", label_visibility="collapsed",
-            placeholder="e.g. Shopee_June_Payday_filtration.xlsx", key="out_name")
+            placeholder="e.g. Shopee_Payday_June_filtration.xlsx", key="out_name")
 
     st.divider()
-
-    # PID rule explainer
-    with st.expander("ℹ️ How the PID-level rule works"):
-        st.markdown("""
-**Pass 1 — per-SKU eligibility check:**
-Each SKU is checked individually: Status = YES, Live date ≤ today, not AM excluded, (optionally) RRP & SRP ≥ minimum.
-
-**Pass 2 — PID-level gate:**
-All SKUs are grouped by Product ID. If **any** SKU in a group failed Pass 1,
-the **entire group** is marked ineligible and all mechanic columns are left blank.
-
-This ensures Shopee's product-level voucher logic: vouchers apply to a whole
-product listing, so a product with even one ineligible variant cannot participate.
-        """)
-
     mechanics = build_mechanics(st.session_state.get("sh_mechanics", []))
     ready = price_file and content_file and zecom_file and mechanics
-
     if not ready:
         st.info("👆 Upload 3 required files and define at least one mechanic to get started")
 
     if st.button("▶  Run Shopee Filtration", disabled=not ready):
-        with st.spinner("Processing (PID-level)..."):
+        with st.spinner("Processing (PID-level, 2-pass)..."):
             try:
                 logs = []
                 def log(m): logs.append(m)
 
-                # Load Content map
+                # ── Content map ───────────────────────────────
                 content_file.seek(0)
                 cwb = openpyxl.load_workbook(content_file, read_only=True, data_only=True)
                 if "content" not in cwb.sheetnames:
@@ -249,7 +275,7 @@ product listing, so a product with even one ineligible variant cannot participat
                 cwb.close()
                 log(f"✓ {len(content_map):,} EAN → ALU_NO mappings")
 
-                # Load zeCOM map
+                # ── zeCOM map ─────────────────────────────────
                 zecom_file.seek(0)
                 zwb = openpyxl.load_workbook(zecom_file, read_only=True, data_only=True)
                 if "MY" not in zwb.sheetnames:
@@ -263,14 +289,14 @@ product listing, so a product with even one ineligible variant cannot participat
                         i = ZECOM_COLS.get(k)
                         return row[i] if i is not None and len(row) > i else None
                     zecom_map[str(style).strip()] = {
-                        "Launch_Date": g("launch_date"), "Status": g("status"),
-                        "Price": g("price"), "Special_Price": g("special_price"),
-                        "Disc_Pct": g("disc_pct"), "Exclusion": g("exclusion"),
+                        "Launch_Date":  g("launch_date"), "Status":       g("status"),
+                        "Price":        g("price"),       "Special_Price":g("special_price"),
+                        "Disc_Pct":     g("disc_pct"),    "Exclusion":    g("exclusion"),
                     }
                 zwb.close()
                 log(f"✓ {len(zecom_map):,} styles from zeCOM ({campaign_type})")
 
-                # Load AM exclusion
+                # ── AM exclusion ──────────────────────────────
                 am_set = set()
                 if am_file:
                     am_file.seek(0)
@@ -280,7 +306,7 @@ product listing, so a product with even one ineligible variant cannot participat
                     awb.close()
                 log(f"✓ {len(am_set):,} AM-excluded ALU_NOs")
 
-                # Load Price/Stock workbook
+                # ── Load Price/Stock workbook ─────────────────
                 price_file.seek(0)
                 wb = openpyxl.load_workbook(price_file)
                 ws = wb[wb.sheetnames[0]]
@@ -294,20 +320,23 @@ product listing, so a product with even one ineligible variant cannot participat
                 sku_col   = fc(sku_col_name)
                 price_col = fc(price_col_name)
                 pid_col   = fc(pid_col_name)
-                if not sku_col:  raise ValueError(f"Column '{sku_col_name}' not found in row 1 — check the 'SKU / EAN column name' in the sidebar")
-                if not price_col: raise ValueError(f"Column '{price_col_name}' not found in row 1 — check the 'Price column name' in the sidebar")
+                if not sku_col:
+                    raise ValueError(f"Column '{sku_col_name}' not found in row 1. "
+                                     f"Available: {[h for h in headers if h]}")
+                if not price_col:
+                    raise ValueError(f"Column '{price_col_name}' not found in row 1.")
                 if not pid_col:
-                    raise ValueError(
-                        f"Column '{pid_col_name}' not found in row 1. "
-                        f"Check the 'Product ID column name' setting in the sidebar."
-                    )
+                    raise ValueError(f"Column '{pid_col_name}' not found in row 1. "
+                                     f"Check 'Product ID column' setting in sidebar.")
                 last_col = max((i for i,h in enumerate(headers,1) if h), default=len(headers))
-                log(f"✓ Sheet='{ws.title}' | PID col='{pid_col_name}' (col {pid_col})")
-                log(f"  Row 1 headers: {[h for h in headers if h]}")
+                log(f"✓ Sheet='{ws.title}' | SKU=col{sku_col} PID=col{pid_col} Price=col{price_col}")
 
-                # ── PASS 1: per-SKU eligibility ──────────────────
-                pass1 = []  # (r, pid, alu_no, row_vals, excl_v, elig)
+                # ── PASS 1: classify each SKU ─────────────────
+                # classification: 'eligible' | 'untracked' | 'status_no' |
+                #                 'future' | 'am_excluded' | 'low_price' | 'no_content'
+                pass1 = []
                 total = matched_alu = matched_zecom = 0
+                N_LOOKUP = 8
 
                 for r in range(int(data_start_row), ws.max_row + 1):
                     sku = ws.cell(row=r, column=sku_col).value
@@ -318,42 +347,57 @@ product listing, so a product with even one ineligible variant cannot participat
                     alu_no = content_map.get(normalise_ean(sku))
 
                     if alu_no is None:
-                        row_vals = [NA] * 8
+                        row_vals = [NA] * N_LOOKUP
+                        clf = "no_content"
                     else:
                         matched_alu += 1
                         rec = zecom_map.get(alu_no)
                         if rec is None:
-                            row_vals = [alu_no] + [NA] * 7
+                            row_vals = [alu_no] + [NA] * (N_LOOKUP - 1)
+                            clf = "untracked"
                         else:
                             matched_zecom += 1
-                            live, status = rec["Launch_Date"], rec["Status"]
-                            rrp, srp, pct, excl = rec["Price"], rec["Special_Price"], rec["Disc_Pct"], rec["Exclusion"]
+                            live   = rec["Launch_Date"]
+                            status = rec["Status"]
+                            rrp    = rec["Price"]
+                            srp    = rec["Special_Price"]
+                            pct    = rec["Disc_Pct"]
+                            excl   = rec["Exclusion"]
                             try:
-                                orig_p = float(str(orig_price).replace("'","").strip()) if orig_price is not None else None
-                                rrp_check = round(float(rrp),2) == round(orig_p,2) if orig_p is not None else NA
+                                orig_p = float(str(orig_price).replace("'","").strip()) \
+                                         if orig_price is not None else None
+                                rrp_check = round(float(rrp),2) == round(orig_p,2) \
+                                            if orig_p is not None else NA
                             except: rrp_check = NA
                             row_vals = [alu_no, live, status, rrp, srp, rrp_check, pct, excl]
+                            clf = classify_sku(status, live, alu_no, rrp, srp, am_set)
+                            # also treat Status=#N/A from zeCOM record as untracked
+                            if status in (NA, None) or status == NA:
+                                clf = "untracked"
 
-                    status_v, live_v, rrp_v, srp_v, excl_v = row_vals[2], row_vals[1], row_vals[3], row_vals[4], row_vals[7]
-                    # ineligible if lookup failed OR individual eligibility fails
-                    elig = (excl_v != NA) and is_eligible_sku(status_v, live_v, alu_no, rrp_v, srp_v, am_set)
-                    pass1.append((r, pid, alu_no, row_vals, excl_v, elig))
+                    excl_v = row_vals[7]
+                    pass1.append((r, pid, alu_no, row_vals, excl_v, clf))
 
-                # ── PASS 2: PID-level gate ────────────────────────
+                log(f"✓ Pass 1: {total:,} SKUs | {matched_alu:,} ALU_NO | {matched_zecom:,} zeCOM")
+
+                # ── PASS 2: PID gate ──────────────────────────
+                # Only real failures block a PID; 'untracked' and 'no_content' do not
+                BLOCKING = {"status_no", "future", "am_excluded", "low_price"}
                 pid_elig = defaultdict(lambda: True)
-                for _, pid, _, _, _, elig in pass1:
-                    if not elig:
+                for _, pid, _, _, _, clf in pass1:
+                    if clf in BLOCKING:
                         pid_elig[pid] = False
 
-                pid_total    = len(pid_elig)
-                pid_ok       = sum(1 for v in pid_elig.values() if v)
-                pid_blocked  = pid_total - pid_ok
-                log(f"✓ {total:,} SKUs | {matched_alu:,} ALU_NO | {matched_zecom:,} zeCOM")
-                log(f"✓ {pid_total:,} Product IDs | {pid_ok:,} eligible | {pid_blocked:,} blocked by PID rule")
+                pid_total   = len(pid_elig)
+                pid_ok      = sum(1 for v in pid_elig.values() if v)
+                pid_blocked = pid_total - pid_ok
+                log(f"✓ Pass 2: {pid_total:,} PIDs | {pid_ok:,} eligible | {pid_blocked:,} blocked")
 
-                # ── Write output ──────────────────────────────────
-                N_LOOKUP = 8
-                new_headers = ["ALU_NO","Live","Status","RRP","SRP","RRP check","%","Exclusions"] + [m["name"] for m in mechanics]
+                # ── Write output ──────────────────────────────
+                new_headers = (
+                    ["ALU_NO","Live","Status","RRP","SRP","RRP check","%","Exclusions"]
+                    + [m["name"] for m in mechanics]
+                )
                 base_font   = Font(name="Aptos Narrow", size=11, bold=False)
                 yellow_fill = PatternFill(fill_type="solid", fgColor="FFFFFF00")
 
@@ -363,17 +407,30 @@ product listing, so a product with even one ineligible variant cannot participat
                     cell.font = base_font
                     if i >= N_LOOKUP: cell.fill = yellow_fill
                     ws.column_dimensions[get_column_letter(col)].width = max(
-                        ws.column_dimensions[get_column_letter(col)].width or 0, 14)
+                        ws.column_dimensions[get_column_letter(col)].width or 0, 16)
 
                 counts = {m["name"]: 0 for m in mechanics}
 
-                for r, pid, alu_no, row_vals, excl_v, sku_elig in pass1:
-                    final_elig = sku_elig and pid_elig.get(pid, True)
+                for r, pid, alu_no, row_vals, excl_v, clf in pass1:
+                    pid_ok_flag = pid_elig.get(pid, True)
                     mech_vals = []
                     for m in mechanics:
-                        if not final_elig:
+                        if clf == "no_content":
+                            # No ALU match → blank everything
                             mech_vals.append("")
+                        elif not pid_ok_flag:
+                            # PID blocked → blank
+                            mech_vals.append("")
+                        elif clf in BLOCKING:
+                            # Individually ineligible → blank
+                            mech_vals.append("")
+                        elif clf == "untracked":
+                            # Not in zeCOM → match only if '#N/A' is in match_values
+                            yes = matches_mechanic(NA, m)
+                            if yes: counts[m["name"]] += 1
+                            mech_vals.append("YES" if yes else "")
                         else:
+                            # clf == 'eligible' → normal Exclusion text matching
                             yes = matches_mechanic(excl_v, m)
                             if yes: counts[m["name"]] += 1
                             mech_vals.append("YES" if yes else "")
@@ -391,21 +448,25 @@ product listing, so a product with even one ineligible variant cannot participat
                 wb.save(buf)
                 buf.seek(0)
 
+                # ── Results ───────────────────────────────────
                 st.success("✅ Shopee filtration complete!")
                 mc = st.columns(4 + len(mechanics))
-                with mc[0]: st.metric("Total SKUs", f"{total:,}")
+                with mc[0]: st.metric("Total SKUs",     f"{total:,}")
                 with mc[1]: st.metric("ALU_NO matched", f"{matched_alu:,}")
-                with mc[2]: st.metric("PIDs eligible", f"{pid_ok:,}")
-                with mc[3]: st.metric("PIDs blocked", f"{pid_blocked:,}")
+                with mc[2]: st.metric("PIDs eligible",  f"{pid_ok:,}")
+                with mc[3]: st.metric("PIDs blocked",   f"{pid_blocked:,}")
                 for i,(n,c) in enumerate(counts.items()):
                     with mc[4+i]: st.metric(n[:22], f"{c:,}")
+
                 with st.expander("📝 Processing Log"):
                     for l in logs: st.text(l)
 
-                fname = out_name.strip() or price_file.name.rsplit(".",1)[0] + "_shopee_filtration.xlsx"
+                fname = (out_name.strip()
+                         or price_file.name.rsplit(".",1)[0] + "_shopee_filtration.xlsx")
                 st.download_button("⬇️  Download Shopee Output", buf, fname,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True)
+
             except Exception as e:
                 st.error(f"❌ {e}"); st.exception(e)
 
@@ -413,26 +474,32 @@ product listing, so a product with even one ineligible variant cannot participat
 # ── TAB 2: CLEAR OUTPUT COLUMNS ────────────────────────────────
 with tab_clear:
     st.subheader("🗑️ Clear Output Columns from Processed File")
-    st.caption("Strips ALU_NO and all appended columns, returning the file to the original Shopee SellerPriceTemplate.")
+    st.caption("Strips ALU_NO and all appended columns, returning the file to the "
+               "original Shopee SellerPriceTemplate.")
     st.divider()
 
-    clear_file = st.file_uploader("Upload processed Excel to clear", type=["xlsx","xls"], key="clear_upload")
+    clear_file = st.file_uploader("Upload processed Excel to clear",
+        type=["xlsx","xls"], key="clear_upload")
 
     if clear_file:
         clear_file.seek(0)
         try:
             wb_p = openpyxl.load_workbook(clear_file, read_only=True)
             ws_p = wb_p[wb_p.sheetnames[0]]
-            row1 = [ws_p.cell(row=1, column=c).value for c in range(1, ws_p.max_column + 1)]
+            row1 = [ws_p.cell(row=1, column=c).value
+                    for c in range(1, ws_p.max_column + 1)]
             wb_p.close()
 
             strip_from = next(
-                (i+1 for i,h in enumerate(row1) if h and str(h).strip().upper() == "ALU_NO"), None)
+                (i+1 for i,h in enumerate(row1)
+                 if h and str(h).strip().upper() == "ALU_NO"), None)
 
             if strip_from:
-                n_strip = len(row1) - strip_from + 1
+                n_strip  = len(row1) - strip_from + 1
                 stripped = [str(row1[c-1]) for c in range(strip_from, len(row1)+1)]
-                st.success(f"✅ Found ALU_NO at column **{get_column_letter(strip_from)}** — will remove **{n_strip}** column(s).")
+                st.success(
+                    f"✅ Found ALU_NO at column **{get_column_letter(strip_from)}** "
+                    f"— will remove **{n_strip}** column(s).")
                 with st.expander("Columns to be removed"):
                     for name in stripped: st.markdown(f"- `{name}`")
                 st.divider()
@@ -442,7 +509,9 @@ with tab_clear:
                         wb_out = openpyxl.load_workbook(clear_file)
                         wb_out[wb_out.sheetnames[0]].delete_cols(strip_from, n_strip)
                         buf = io.BytesIO(); wb_out.save(buf); buf.seek(0)
-                    clean_name = clear_file.name.replace("_shopee_filtration","").rsplit(".",1)[0] + "_clean.xlsx"
+                    clean_name = (clear_file.name
+                                  .replace("_shopee_filtration","")
+                                  .rsplit(".",1)[0] + "_clean.xlsx")
                     st.download_button("⬇️  Download Clean File", buf, clean_name,
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True)
